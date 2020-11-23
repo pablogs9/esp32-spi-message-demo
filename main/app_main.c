@@ -17,6 +17,19 @@
 #include "decode_mobilenet.h"
 #include "esp32_spi_impl.h"
 
+
+// micro-ROS variables ----
+
+#define MICRO_ROS_QUEUE_LENGTH    10
+#define MICRO_ROS_ITEM_SIZE       200
+static StaticQueue_t micro_ros_queue;
+QueueHandle_t micro_ros_queue_handle;
+uint8_t micro_ros_queue_buffer[ MICRO_ROS_QUEUE_LENGTH * MICRO_ROS_ITEM_SIZE ];
+extern void init_microros();
+
+// ------------------------
+
+
 #define DEBUG_CMD 0
 #define debug_cmd_print(...) \
     do { if (DEBUG_CMD) fprintf(stderr, __VA_ARGS__); } while (0)
@@ -236,6 +249,10 @@ uint8_t spi_pop_message(SpiStatusResp *response, char * stream_name, SpiProtocol
 //Main application
 void app_main()
 {
+
+    micro_ros_queue_handle = xQueueCreateStatic( MICRO_ROS_QUEUE_LENGTH, MICRO_ROS_ITEM_SIZE, micro_ros_queue_buffer, &micro_ros_queue );
+    init_microros();
+
     uint8_t req_success = 0;
 
     //TODO: move these into spi messaging?
@@ -285,15 +302,15 @@ void app_main()
                 int num_found = decode_mobilenet(dets, (half *)p_get_message_resp.data, 0.5f, MAX_DETECTIONS);
                 printf("num_found %d \n", num_found);
 
-                if(num_found > 0){
-                    for(int i=0; i<num_found; i++){
-                        printf("LABEL:%f X(%.3f %.3f), Y(%.3f %.3f) CONFIDENCE: %.3f\n",
-                                dets[i].label,
-                                dets[i].x_min, dets[i].x_max,
-                                dets[i].y_min, dets[i].y_max, dets[i].confidence);
-                    }
-                }else{
-                    printf("none found\n");
+            if(num_found > 0){
+                for(int i=0; i<num_found; i++){
+                    char buf [100];
+                    sprintf(buf, "LABEL:%f X(%.3f %.3f), Y(%.3f %.3f) CONFIDENCE: %.3f",
+                            dets[i].label,
+                            dets[i].x_min, dets[i].x_max,
+                            dets[i].y_min, dets[i].y_max, dets[i].confidence);
+                    printf("%s\n", buf);
+                    xQueueSend(micro_ros_queue_handle, buf, 0);
                 }
             }
 
