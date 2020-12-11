@@ -5,6 +5,10 @@ set(SOURCES
     # depthai-spi-library sources
     depthai-spi-library/spi_protocol.c
     depthai-spi-library/spi_messaging.c
+    # micro-ROS
+    micro_ros.c
+    micro_ros_utils.c
+    wifi_connection_utils.c
     # project
     app_main.cpp
     esp32_spi_impl.c

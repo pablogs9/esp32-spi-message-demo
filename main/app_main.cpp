@@ -40,6 +40,23 @@
 
 using json = nlohmann::json;
 
+// micro-ROS variables ----
+
+#include <micro_ros.h>
+
+static StaticQueue_t micro_ros_queue_detections;
+QueueHandle_t micro_ros_queue_detections_handle;
+uint8_t micro_ros_queue_detections_buffer[ MAX_DETECTIONS *  sizeof(micro_ros_detection_t) ];
+
+static StaticQueue_t micro_ros_queue_image;
+QueueHandle_t micro_ros_queue_image_handle;
+uint8_t micro_ros_queue_image_buffer[ 1 * sizeof(micro_ros_fragment_t) ];
+
+SemaphoreHandle_t micro_ros_semaphore = NULL;
+StaticSemaphore_t micro_ros_mutex;
+
+// ------------------------
+
 static const char* NOSTREAM = "";
 static const char* METASTREAM = "spimetaout";
 static const char* PREVIEWSTREAM = "spipreview";
@@ -292,17 +309,18 @@ void exampleDecodeMobilenet(SpiGetMessageResp get_message_resp){
     Detection dets[MAX_DETECTIONS];
 
     int num_found = decode_mobilenet(dets, (half *)get_message_resp.data, 0.5f, MAX_DETECTIONS);
-    printf("num_found %d \n", num_found);
+    // printf("num_found %d \n", num_found);
 
     if(num_found > 0){
         for(int i=0; i<num_found; i++){
+            
             printf("LABEL:%f X(%.3f %.3f), Y(%.3f %.3f) CONFIDENCE: %.3f\n",
                     dets[i].label,
                     dets[i].x_min, dets[i].x_max,
                     dets[i].y_min, dets[i].y_max, dets[i].confidence);
         }
     }else{
-        printf("none found\n");
+        // printf("none found\n");
     }
 }
 // ----------------------------------------
@@ -363,6 +381,7 @@ uint8_t req_metadata(SpiGetMessageResp *get_message_resp, const char* stream_nam
 // ----------------------------------------
 // example of resending a large message as it's received
 // ----------------------------------------
+
 uint8_t resend_large_message(const char* stream_name, SpiProtocolInstance* spi_proto_instance, SpiProtocolPacket* spi_send_packet){
     uint8_t req_success = 0;
 
@@ -376,37 +395,36 @@ uint8_t resend_large_message(const char* stream_name, SpiProtocolInstance* spi_p
         spi_generate_command(spi_send_packet, GET_MESSAGE, strlen(stream_name)+1, stream_name);
         generic_send_spi(spi_send_packet);
 
+        micro_ros_fragment_t fragment;
+        fragment.data = NULL;
+        fragment.len = 0;
+        xQueueSend(micro_ros_queue_image_handle, &fragment, portMAX_DELAY);
+        
         uint32_t size = get_size_resp.size;
         uint32_t total_recv = 0;
         while(total_recv < size){
             char recvbuf[BUFF_MAX_SIZE] = {0};
+            xSemaphoreTake( micro_ros_semaphore, portMAX_DELAY );
             req_success = generic_recv_spi(recvbuf);
             if(req_success){
                 if(recvbuf[0]==START_BYTE_MAGIC){
                     SpiProtocolPacket* spiRecvPacket = spi_protocol_parse(spi_proto_instance, (uint8_t*)recvbuf, sizeof(recvbuf));
                     uint32_t remaining_data = size-total_recv;
-                    if ( remaining_data < PAYLOAD_MAX_SIZE ){
-                        //--------------------------------------------
-                        //  Transmit data here
-                        //--------------------------------------------
-                        usleep(2000);
-                        debug_cmd_print("mock transmit data... %d/%d\n", total_recv, size);
-                        if(DEBUG_MESSAGE_CONTENTS){
-                            debug_print_hex((uint8_t*)spiRecvPacket->data, PAYLOAD_MAX_SIZE);
-                        }
-                        
-                        total_recv += remaining_data;
-                    } else {
-                        //--------------------------------------------
-                        //  Transmit data here
-                        //--------------------------------------------
-                        usleep(2000);
-                        debug_cmd_print("mock transmit data... %d/%d\n", total_recv, size);
-                        if(DEBUG_MESSAGE_CONTENTS){
-                            debug_print_hex((uint8_t*)spiRecvPacket->data, PAYLOAD_MAX_SIZE);
-                        }
-                        total_recv += PAYLOAD_MAX_SIZE;
+                    uint32_t available_data = (remaining_data < PAYLOAD_MAX_SIZE) ? remaining_data : PAYLOAD_MAX_SIZE;
+                    //--------------------------------------------
+                    //  Transmit data here
+                    //--------------------------------------------
+                    // memcpy(&image_buffer[total_recv], spiRecvPacket->data, available_data);
+                    fragment.data = spiRecvPacket->data;
+                    fragment.len = available_data;
+                    xQueueSend(micro_ros_queue_image_handle, &fragment, portMAX_DELAY);
+                    xSemaphoreGive(micro_ros_semaphore);
+
+                    if(DEBUG_MESSAGE_CONTENTS){
+                        debug_print_hex((uint8_t*)spiRecvPacket->data, available_data);
                     }
+                    
+                    total_recv += available_data;
 
                 }else if(recvbuf[0] != 0x00){
                     printf("*************************************** got a half/non aa packet ************************************************\n");
@@ -431,6 +449,12 @@ uint8_t resend_large_message(const char* stream_name, SpiProtocolInstance* spi_p
 //Main application
 void app_main()
 {
+    micro_ros_queue_detections_handle = xQueueCreateStatic( MAX_DETECTIONS, sizeof(micro_ros_detection_t), micro_ros_queue_detections_buffer, &micro_ros_queue_detections );
+    micro_ros_queue_image_handle = xQueueCreateStatic( 1, sizeof(micro_ros_fragment_t), micro_ros_queue_image_buffer, &micro_ros_queue_image );
+    micro_ros_semaphore = xSemaphoreCreateMutexStatic( &micro_ros_mutex );
+
+    init_microros();
+
     uint8_t req_success = 0;
     SpiProtocolInstance* spi_proto_instance = (SpiProtocolInstance*) malloc(sizeof(SpiProtocolInstance));
     SpiProtocolPacket* spi_send_packet = (SpiProtocolPacket*) malloc(sizeof(SpiProtocolPacket));
@@ -441,17 +465,6 @@ void app_main()
     // init spi protocol
     spi_protocol_init(spi_proto_instance);
 
-    // ----------------------------------------
-    // example of grabbing the available streams. they'll match what's defined in the SPI nodes.
-    // ----------------------------------------
-    SpiGetStreamsResp p_get_streams_resp;
-    req_success = spi_get_streams(&p_get_streams_resp, spi_proto_instance, spi_send_packet);
-    printf("Available Streams: \n");
-    for(int i=0; i<p_get_streams_resp.numStreams; i++){
-        printf("%s\n", p_get_streams_resp.stream_names[i]);
-    }
-
-
     while(1) {
         // ----------------------------------------
         // example of receiving messages.
@@ -459,65 +472,69 @@ void app_main()
         // the req_data method allocates memory for the received packet. we need to be sure to free it when we're done with it.
         SpiGetMessageResp get_message_resp;
 
-        req_success = req_data(&get_message_resp, METASTREAM, spi_proto_instance, spi_send_packet);
-        std::vector<uint8_t> data;
-        if(req_success){
-            if(DECODE_MOBILENET){
-                // ----------------------------------------
-                // example of decoding mobilenet (ENABLE DECODE_MOBILENET flag).
-                // ----------------------------------------
-                exampleDecodeMobilenet(get_message_resp);
-            } else {
-                // ----------------------------------------
-                // receive raw data 
-                // ----------------------------------------
-                data = std::vector<std::uint8_t>(get_message_resp.data, get_message_resp.data + get_message_resp.data_size);    
-            }
-            free(get_message_resp.data);
-        }
+        // req_success = req_data(&get_message_resp, METASTREAM, spi_proto_instance, spi_send_packet);
+        // std::vector<uint8_t> data;
+        // if(req_success){
+        //     if(DECODE_MOBILENET){
+        //         // ----------------------------------------
+        //         // example of decoding mobilenet (ENABLE DECODE_MOBILENET flag).
+        //         // ----------------------------------------
+        //         exampleDecodeMobilenet(get_message_resp);
+        //     } else {
+        //         // ----------------------------------------
+        //         // receive raw data 
+        //         // ----------------------------------------
+        //         data = std::vector<std::uint8_t>(get_message_resp.data, get_message_resp.data + get_message_resp.data_size);    
+        //     }
+        //     free(get_message_resp.data);
+        // }
 
         // ----------------------------------------
         // example of getting message metadata
         // ----------------------------------------
         // the req_metadata method allocates memory for the received packet. we need to be sure to free it when we're done with it.
-        SpiGetMessageResp get_meta_resp;
+        // SpiGetMessageResp get_meta_resp;
 
-        req_success = req_metadata(&get_meta_resp, METASTREAM, spi_proto_instance, spi_send_packet);
-        if(req_success){
-            if(DEBUG_METADATA){
-                json j = json::from_msgpack(get_meta_resp.data, get_meta_resp.data + get_meta_resp.data_size);
-                printf("Unpacked metadata: %s\n", j.dump().c_str());
-            }
+        // req_success = req_metadata(&get_meta_resp, METASTREAM, spi_proto_instance, spi_send_packet);
+        // if(req_success){
+        //     if(DEBUG_METADATA){
+        //         json j = json::from_msgpack(get_meta_resp.data, get_meta_resp.data + get_meta_resp.data_size);
+        //         printf("Unpacked metadata: %s\n", j.dump().c_str());
+        //     }
 
-            // ----------------------------------------
-            // example of parsing out basic ImgDetection type.
-            // ----------------------------------------
-            switch ((dai::DatatypeEnum) get_meta_resp.data_type)
-            {
-            case dai::DatatypeEnum::ImgDetections :
-            {
-                dai::RawImgDetections det;
-                dai::parseMessage(get_meta_resp.data, get_meta_resp.data_size, det);
+        //     // ----------------------------------------
+        //     // example of parsing out basic ImgDetection type.
+        //     // ----------------------------------------
+        //     switch ((dai::DatatypeEnum) get_meta_resp.data_type)
+        //     {
+        //     case dai::DatatypeEnum::ImgDetections :
+        //     {
+        //         dai::RawImgDetections det;
+        //         dai::parseMessage(get_meta_resp.data, get_meta_resp.data_size, det);
 
-                for(const auto& det : det.detections){
-                    printf("label: %d, xmin: %f, ymin: %f, xmax: %f, ymax: %f\n", det.label, det.xmin, det.ymin, det.xmax, det.ymax);
-                }
-            }
-            break;
+        //         micro_ros_detection_t uros_det;
+        //         for(const auto& det : det.detections){
+        //             convert_detection(det, &uros_det);
+        //             xQueueSend(micro_ros_queue_detections_handle, &uros_det, 0);
+
+        //             printf("label: %d -> %f %f %f\n", det.label, det.xdepth, det.ydepth, det.zdepth);
+        //         }
+        //     }
+        //     break;
             
-            default:
-                break;
-            }
+        //     default:
+        //         break;
+        //     }
                     
-            free(get_meta_resp.data);
-        }
+        //     free(get_meta_resp.data);
+        // }
 
 
         // ----------------------------------------
         // example of retransmitting a jpeg
         // ----------------------------------------
         // get jpeg size
-        //req_success = resend_large_message(PREVIEWSTREAM, spi_proto_instance, spi_send_packet);
+        req_success = resend_large_message(PREVIEWSTREAM, spi_proto_instance, spi_send_packet);
 
         // ----------------------------------------
         // pop current message/metadata. this tells the depthai to update the info being passed back using the spi_cmds.
